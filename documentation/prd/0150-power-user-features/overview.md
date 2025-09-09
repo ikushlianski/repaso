@@ -1,4 +1,4 @@
-# 0018 - Advanced Features
+# 0018 - Power User Features
 
 Power user features that enhance the core learning experience for users who want more control and customization.
 

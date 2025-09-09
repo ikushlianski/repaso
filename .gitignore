@@ -1,2 +1,7 @@
 node_modules
+
+# IDEs
+.vscode/
 .cursor/
+.idea/
+.claude/
