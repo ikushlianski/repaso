@@ -1,0 +1,342 @@
+name: Idea Processing Flow
+
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  route-trigger:
+    runs-on: ubuntu-latest
+    outputs:
+      action: ${{ steps.router.outputs.action }}
+      agent: ${{ steps.router.outputs.agent }}
+      issue-number: ${{ steps.router.outputs.issue-number }}
+    steps:
+      - name: Route trigger to action
+        id: router
+        run: |
+          # Issue with "idea" = start flow with product strategist
+          if [[ "${{ github.event_name }}" == "issues" ]] && [[ "${{ contains(github.event.issue.title, 'idea') || contains(github.event.issue.title, 'Idea') || contains(github.event.issue.title, 'IDEA') || contains(github.event.issue.labels.*.name, 'idea') || contains(github.event.issue.labels.*.name, 'Idea') }}" == "true" ]]; then
+            echo "action=start-flow" >> $GITHUB_OUTPUT
+            echo "agent=product-strategist" >> $GITHUB_OUTPUT
+            echo "issue-number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+
+          # Comment with /next-agent = move to next agent in sequence
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]] && [[ "${{ contains(github.event.comment.body, '/next-agent') }}" == "true" ]]; then
+            # Fixed sequence: product-strategist → architect → completed
+            if [[ "${{ contains(github.event.issue.labels.*.name, 'agent:product-strategist') }}" == "true" ]]; then
+              next_agent="architect"
+            elif [[ "${{ contains(github.event.issue.labels.*.name, 'agent:architect') }}" == "true" ]]; then
+              next_agent="completed"
+            else
+              next_agent="architect"  # Default to architect if unclear
+            fi
+
+            echo "action=next-agent" >> $GITHUB_OUTPUT
+            echo "agent=$next_agent" >> $GITHUB_OUTPUT
+            echo "issue-number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+
+          # Comment with /finalize = complete flow
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]] && [[ "${{ contains(github.event.comment.body, '/finalize') }}" == "true" ]]; then
+            echo "action=finalize" >> $GITHUB_OUTPUT
+            echo "issue-number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+
+          # PR comment = continue iterative conversation with current agent
+          elif [[ "${{ github.event_name }}" == "pull_request_review_comment" ]]; then
+            # Detect current agent from PR labels
+            if [[ "${{ contains(github.event.pull_request.labels.*.name, 'agent:product-strategist') }}" == "true" ]]; then
+              current_agent="product-strategist"
+            elif [[ "${{ contains(github.event.pull_request.labels.*.name, 'agent:architect') }}" == "true" ]]; then
+              current_agent="architect"
+            else
+              current_agent="product-strategist"
+            fi
+
+            echo "action=continue-conversation" >> $GITHUB_OUTPUT
+            echo "agent=$current_agent" >> $GITHUB_OUTPUT
+
+          else
+            echo "action=none" >> $GITHUB_OUTPUT
+          fi
+
+  start-flow:
+    needs: route-trigger
+    if: needs.route-trigger.outputs.action == 'start-flow'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Create milestone and feature structure
+        id: create-structure
+        run: |
+          # Create unique milestone and feature paths
+          timestamp=$(date +%s)
+          milestone_id=$(printf "%03d" $((10 + ($timestamp % 90))))
+          feature_id=$(printf "%03d" $((1 + ($timestamp % 99))))
+
+          milestone_name="${milestone_id}-idea-milestone-${{ needs.route-trigger.outputs.issue-number }}"
+          feature_name="${feature_id}-idea-feature-${{ needs.route-trigger.outputs.issue-number }}"
+
+          feature_path="todos/${milestone_name}/${feature_name}"
+          mkdir -p "$feature_path"
+
+          echo "feature-path=$feature_path" >> $GITHUB_OUTPUT
+
+          # Create initial feature.md file
+          cat > "$feature_path/feature.md" << EOF
+          # Feature: ${{ github.event.issue.title }}
+
+          **Source Issue:** #${{ needs.route-trigger.outputs.issue-number }}
+          **Status:** Product Strategist Phase
+          **Agent Sequence:** product-strategist → architect → complete
+
+          ## Original Idea
+          ${{ github.event.issue.body }}
+
+          ## Agent Progress
+          - [ ] Product Strategist - Story Creation
+          - [ ] Architect - Technical Design
+          EOF
+
+      - name: Run Product Strategist Agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are acting as a Product Strategist agent according to the guidelines in docs-framework/agents/product-strategist.md.
+
+            Process this GitHub issue as a product idea:
+            Title: ${{ github.event.issue.title }}
+            Body: ${{ github.event.issue.body }}
+            Issue URL: ${{ github.event.issue.html_url }}
+
+            Your tasks:
+            1. Create a story.md file in the feature directory: ${{ steps.create-structure.outputs.feature-path }}/story.md
+            2. Include user story format with acceptance criteria
+            3. Ask clarifying questions within the story.md file
+            4. Follow the project's user story template format
+
+            Create comprehensive questions for the human to answer. They will respond via GitHub PR comments and can discuss iteratively until satisfied, then use `/next-agent` to move to the architect phase.
+
+      - name: Create PR for conversation
+        id: create-pr
+        run: |
+          # Create feature branch
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "idea-processing-${{ needs.route-trigger.outputs.issue-number }}"
+          git add .
+          git commit -m "Product strategist analysis for idea #${{ needs.route-trigger.outputs.issue-number }}"
+          git push origin "idea-processing-${{ needs.route-trigger.outputs.issue-number }}"
+
+          # Create PR
+          pr_number=$(gh pr create \
+            --title "Idea Processing: ${{ github.event.issue.title }}" \
+            --body "Processing idea from issue #${{ needs.route-trigger.outputs.issue-number }}\\n\\nFeature path: \`${{ steps.create-structure.outputs.feature-path }}\`\\n\\n## Commands\\n- Comment in PR for iterative discussion with current agent\\n- \`/next-agent\` - Move to architect phase (when satisfied with current work)\\n- \`/finalize\` - Complete processing and merge" \
+            --label "agent:product-strategist" \
+            --label "idea-processing" | grep -o '[0-9]\+' | head -1)
+
+          echo "pr-number=$pr_number" >> $GITHUB_OUTPUT
+
+          # Add agent label to issue for tracking
+          gh issue edit ${{ needs.route-trigger.outputs.issue-number }} --add-label "agent:product-strategist"
+
+          # Update issue with PR link
+          gh issue comment ${{ needs.route-trigger.outputs.issue-number }} --body "🚀 **Idea processing started!**\\n\\nProduct Strategist has created initial analysis.\\n\\n📋 **PR for discussion:** #$pr_number\\n\\n💬 **Continue conversation in the PR comments**\\n\\n**Commands:**\\n- Comment in PR to discuss with Product Strategist\\n- \`/next-agent\` - Move to Architect phase when satisfied\\n- \`/finalize\` - Complete processing"
+
+  continue-conversation:
+    needs: route-trigger
+    if: needs.route-trigger.outputs.action == 'continue-conversation'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get PR and conversation context
+        id: get-context
+        run: |
+          # Find PR for this conversation
+          if [[ "${{ github.event_name }}" == "pull_request_review_comment" ]]; then
+            pr_number="${{ github.event.pull_request.number }}"
+          else
+            # Find PR linked to this issue
+            pr_number=$(gh pr list --search "idea #${{ needs.route-trigger.outputs.issue-number }}" --json number --jq '.[0].number // empty')
+          fi
+
+          if [[ "$pr_number" != "" ]]; then
+            echo "pr-number=$pr_number" >> $GITHUB_OUTPUT
+
+            # Get conversation history
+            conversation=$(gh pr view $pr_number --json comments --jq '.comments[] | "\(.author.login): \(.body)"' | tail -10)
+
+            # Extract feature path from PR body
+            feature_path=$(gh pr view $pr_number --json body --jq '.body' | grep -o 'todos/[^`]*' | head -1)
+            echo "feature-path=$feature_path" >> $GITHUB_OUTPUT
+
+            # Store conversation (truncate if too long)
+            echo "conversation<<EOF" >> $GITHUB_OUTPUT
+            echo "$conversation" | head -1500 >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "Error: No PR found for conversation" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Run Current Agent for Iterative Discussion
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are acting as a ${{ needs.route-trigger.outputs.agent }} agent according to the guidelines in docs-framework/agents/${{ needs.route-trigger.outputs.agent }}.md.
+
+            Continue iterative conversation with the human about this idea processing.
+
+            **Feature path:** ${{ steps.get-context.outputs.feature-path }}
+            **Recent conversation:**
+            ${{ steps.get-context.outputs.conversation }}
+
+            **Your tasks:**
+            1. Review the conversation and any questions/feedback from the human
+            2. Update relevant files if needed based on the discussion
+            3. Respond in PR comments to continue the iterative conversation
+            4. Ask follow-up questions if needed
+
+            Keep the conversation going until the human is satisfied and uses `/next-agent` to move forward.
+
+  next-agent:
+    needs: route-trigger
+    if: needs.route-trigger.outputs.action == 'next-agent'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get feature path and PR details
+        id: get-details
+        run: |
+          # Find PR for this issue
+          pr_number=$(gh pr list --search "idea #${{ needs.route-trigger.outputs.issue-number }}" --json number --jq '.[0].number // empty')
+
+          if [[ "$pr_number" != "" ]]; then
+            echo "pr-number=$pr_number" >> $GITHUB_OUTPUT
+
+            # Extract feature path from PR body
+            feature_path=$(gh pr view $pr_number --json body --jq '.body' | grep -o 'todos/[^`]*' | head -1)
+            echo "feature-path=$feature_path" >> $GITHUB_OUTPUT
+
+            # Get full conversation history for handoff
+            conversation=$(gh pr view $pr_number --json comments --jq '.comments[] | "\(.author.login): \(.body)"')
+            echo "conversation<<EOF" >> $GITHUB_OUTPUT
+            echo "$conversation" | head -2000 >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "Error: No PR found for this issue" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Handle agent transition
+        run: |
+          if [[ "${{ needs.route-trigger.outputs.agent }}" == "architect" ]]; then
+            # Update labels for architect phase
+            gh pr edit ${{ steps.get-details.outputs.pr-number }} \
+              --remove-label "agent:product-strategist" \
+              --add-label "agent:architect"
+
+            gh issue edit ${{ needs.route-trigger.outputs.issue-number }} \
+              --remove-label "agent:product-strategist" \
+              --add-label "agent:architect"
+
+          elif [[ "${{ needs.route-trigger.outputs.agent }}" == "completed" ]]; then
+            # Mark as completed, ready for finalization
+            gh pr edit ${{ steps.get-details.outputs.pr-number }} \
+              --remove-label "agent:architect" \
+              --add-label "ready-to-merge"
+
+            gh issue edit ${{ needs.route-trigger.outputs.issue-number }} \
+              --remove-label "agent:architect" \
+              --add-label "processing-completed"
+
+            # Comment that processing is complete
+            gh pr comment ${{ steps.get-details.outputs.pr-number }} --body "✅ **All agent phases completed!**\\n\\nBoth Product Strategist and Architect have finished their work.\\n\\n🔄 Use \`/finalize\` to merge and complete the process."
+            exit 0
+          fi
+
+      - name: Run Next Agent
+        if: needs.route-trigger.outputs.agent != 'completed'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            You are taking over as the ${{ needs.route-trigger.outputs.agent }} agent according to the guidelines in docs-framework/agents/${{ needs.route-trigger.outputs.agent }}.md.
+
+            **Handoff Context:**
+            - Feature path: ${{ steps.get-details.outputs.feature-path }}
+            - Previous conversation: ${{ steps.get-details.outputs.conversation }}
+
+            **Your tasks:**
+            1. Review all previous work in the feature directory
+            2. Continue from where the previous agent left off
+            3. Create your phase's deliverables (architecture.md for architect)
+            4. Ask clarifying questions for your domain
+            5. Comment on the PR to introduce yourself and outline next steps
+
+            Take ownership of this phase and start the conversation with the human.
+
+  finalize-flow:
+    needs: route-trigger
+    if: needs.route-trigger.outputs.action == 'finalize'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Get PR details
+        id: get-details
+        run: |
+          pr_number=$(gh pr list --search "idea #${{ needs.route-trigger.outputs.issue-number }}" --json number --jq '.[0].number // empty')
+          echo "pr-number=$pr_number" >> $GITHUB_OUTPUT
+
+      - name: Merge PR and close issue
+        run: |
+          # Merge the PR
+          gh pr merge ${{ steps.get-details.outputs.pr-number }} --squash --delete-branch
+
+          # Close the original issue
+          gh issue close ${{ needs.route-trigger.outputs.issue-number }} --comment "✅ **Idea processing completed!**\\n\\nAgent sequence finished: Product Strategist → Architect\\n\\n📁 Documentation is now available in the main branch.\\n\\n🚀 Ready for development implementation!"
